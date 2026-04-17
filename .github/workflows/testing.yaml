@@ -1,29 +1,46 @@
 name: Snyk Combined Scan With SAST    # Full SCA + SAST + IaC, eval modes
 
-# on:
-#   push:
-#     branches:
-#       - snyk-testing                
-#   pull_request:
-#     branches:
-#       - snyk-testing   
 on:
   workflow_dispatch:
     inputs:
+      repo_url:
+        description: "GitHub repository URL (for example: https://github.com/org/repo)"
+        required: true
       branch:
         description: "Branch name to scan"
         required: true
-        default: "main"             
+        default: "main"
 
 jobs:
   security:
-    # runs-on: enterprise-runners     
-    runs-on: ubuntu-latest             
-
+    runs-on: ubuntu-latest          # Use GitHub-hosted runner
 
     steps:
+      - name: Resolve repository from input
+        id: resolve_repo
+        shell: bash
+        run: |
+          INPUT_REPO="${{ github.event.inputs.repo_url }}"
+
+          # Accept either full URL or owner/repo format.
+          if [[ "$INPUT_REPO" =~ ^https://github\.com/([^/]+/[^/.]+)(\.git)?/?$ ]]; then
+            REPO_NAME="${BASH_REMATCH[1]}"
+          elif [[ "$INPUT_REPO" =~ ^[^/]+/[^/]+$ ]]; then
+            REPO_NAME="$INPUT_REPO"
+          else
+            echo "Invalid repo input: $INPUT_REPO"
+            echo "Use https://github.com/<owner>/<repo> or <owner>/<repo>"
+            exit 1
+          fi
+
+          echo "repository=$REPO_NAME" >> "$GITHUB_OUTPUT"
+
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.resolve_repo.outputs.repository }}
+          ref: ${{ github.event.inputs.branch }}
+          token: ${{ secrets.GITHUB_TOKEN }}
         # Pulls the repository contents into the runner workspace so Snyk
         # can see all files (source, manifests, Terraform, K8s, etc.).
 
@@ -130,5 +147,5 @@ jobs:
           # Final guard step:
           # Ensures that even if Snyk commands returned non-zero exit codes,
           # the overall job is marked successful. This keeps the entire workflow
-          # strictly informational / evaluation‑only for snyk-testing.
-          echo "Snyk combined SCA + SAST + IaC scan ran in eval mode on enterprise runner; findings will not block."
+          # strictly informational / evaluation‑only.
+          echo "Snyk combined SCA + SAST + IaC scan ran in eval mode on GitHub-hosted runner; findings will not block."
