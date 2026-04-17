@@ -1,22 +1,22 @@
 name: Snyk Combined Scan With SAST    # Full SCA + SAST + IaC, eval modes
 
 on:
-  push:
-    branches:
-      # - snyk-testing
-      - main
-  pull_request:
-    branches:
-      # - snyk-testing                
-      - main
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch name to scan"
+        required: true
+        default: "main"
 
 jobs:
   security:
-    runs-on: enterprise-runners     # Use your self-hosted enterprise runners
+    runs-on: ubuntu-latest          # Use GitHub-hosted runner
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
         # Pulls the repository contents into the runner workspace so Snyk
         # can see all files (source, manifests, Terraform, K8s, etc.).
 
@@ -123,5 +123,5 @@ jobs:
           # Final guard step:
           # Ensures that even if Snyk commands returned non-zero exit codes,
           # the overall job is marked successful. This keeps the entire workflow
-          # strictly informational / evaluation‑only for snyk-testing.
-          echo "Snyk combined SCA + SAST + IaC scan ran in eval mode on enterprise runner; findings will not block."
+          # strictly informational / evaluation‑only.
+          echo "Snyk combined SCA + SAST + IaC scan ran in eval mode on GitHub-hosted runner; findings will not block."
