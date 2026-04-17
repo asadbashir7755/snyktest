@@ -1,152 +1,192 @@
-name: Snyk Combined Scan With SAST    # Full SCA + SAST + IaC, eval modes
+name: Snyk Combined Scan (Reusable + Manual)
 
 on:
   workflow_dispatch:
     inputs:
-      repo_url:
-        description: "GitHub repository URL (for example: https://github.com/org/repo)"
+      repo:
+        description: "Repository (org/repo)"
         required: true
       branch:
-        description: "Branch name to scan"
+        description: "Branch to scan"
         required: true
         default: "main"
 
+  workflow_call:
+    inputs:
+      repo:
+        required: true
+        type: string
+      branch:
+        required: true
+        type: string
+    secrets:
+      GH_PAT:
+        required: true
+      SNYK_TOKEN:
+        required: true
+      SNYK_ORG_ID:
+        required: true
+
+permissions:
+  contents: read
+  security-events: write
+
 jobs:
   security:
-    environment: test
-    runs-on: ubuntu-latest          
+    runs-on: enterprise-runners
+
+    env:
+      SNYK_ORG_ID: ${{ secrets.SNYK_ORG_ID }}
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      SNYK_SDLC: DEVELOPMENT
+      SNYK_REMOTE_REPO_URL: https://github.com/${{ inputs.repo }}
+      SNYK_TARGET_REF: ${{ inputs.branch }}-${{ github.run_id }}
 
     steps:
-      - name: Resolve repository from input
-        id: resolve_repo
-        shell: bash
-        run: |
-          INPUT_REPO="${{ github.event.inputs.repo_url }}"
-
-          # Accept either full URL or owner/repo format.
-          if [[ "$INPUT_REPO" =~ ^https://github\.com/([^/]+/[^/.]+)(\.git)?/?$ ]]; then
-            REPO_NAME="${BASH_REMATCH[1]}"
-          elif [[ "$INPUT_REPO" =~ ^[^/]+/[^/]+$ ]]; then
-            REPO_NAME="$INPUT_REPO"
-          else
-            echo "Invalid repo input: $INPUT_REPO"
-            echo "Use https://github.com/<owner>/<repo> or <owner>/<repo>"
-            exit 1
-          fi
-
-          echo "repository=$REPO_NAME" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout code
+      # =========================
+      # Checkout
+      # =========================
+      - name: Checkout target repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ steps.resolve_repo.outputs.repository }}
-          ref: ${{ github.event.inputs.branch }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-        # Pulls the repository contents into the runner workspace so Snyk
-        # can see all files (source, manifests, Terraform, K8s, etc.).
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.branch }}
+          token: ${{ secrets.GH_PAT }}
+          path: target-repo
 
+      # =========================
+      # Setup Snyk
+      # =========================
       - name: Setup Snyk CLI
         uses: snyk/actions/setup@master
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        # Installs the Snyk CLI on the runner and wires it to use SNYK_TOKEN.
-        # After this, we can call `snyk ...` in normal shell commands.
 
-      - name: Configure Snyk endpoint and auth
-        continue-on-error: true
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-          SNYK_ORG_ID: ${{ secrets.SNYK_ORG_ID }}
+      - name: Configure Snyk
         run: |
-          # Configure Snyk for the Worldpay US region and authenticate.
-          # Equivalent to running these in a terminal on the runner:
-          #   snyk config set endpoint=https://api.us.snyk.io
-          #   snyk auth "$SNYK_TOKEN"
           snyk config set endpoint=https://api.us.snyk.io
           snyk auth "$SNYK_TOKEN"
 
+      # =========================
+      # Detect Manifests
+      # =========================
       - name: Detect supported app manifests
         id: detect_manifests
+        working-directory: target-repo
         run: |
-          # SCA pre-check:
-          # Look for common dependency manifest files anywhere in the repo.
-          # This tells us whether it makes sense to run open‑source SCA scans.
-          if git ls-files | grep -E '(^|/)(package\.json|pom\.xml|build\.gradle|build\.gradle\.kts|requirements\.txt|Pipfile|poetry\.lock|pyproject\.toml|go\.mod|Gemfile|composer\.json|paket\.dependencies|packages\.config|project\.assets\.json|Package\.swift)$' >/dev/null; then
+          if git ls-files | grep -E '(^|/)(package\.json|pom\.xml|build\.gradle|requirements\.txt|go\.mod|Gemfile)' >/dev/null; then
             echo "has_manifests=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_manifests=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Snyk IaC test (eval mode)
+      # =========================================================
+      # 🔵 PR FLOW → SAST + SARIF ONLY
+      # =========================================================
+      - name: Snyk Code test (PR → SARIF)
+        if: github.event_name == 'pull_request'
+        working-directory: target-repo
         continue-on-error: true
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-          SNYK_ORG_ID: ${{ secrets.SNYK_ORG_ID }}
         run: |
-          # INFRA / IaC SCAN
-          # Always run IaC scanning over the repo:
-          # - Terraform
-          # - Kubernetes manifests / Helm output it can parse
-          # - Other supported YAML/JSON IaC
-          # Note: Snyk IaC does NOT parse Pulumi programs directly; it only
-          # scans any Terraform/K8s/YAML/JSON artifacts present.
-          # Eval mode: issues will be reported but not block the pipeline.
-          snyk iac test . --org="$SNYK_ORG_ID" --severity-threshold=low
+          snyk code test \
+            --org="$SNYK_ORG_ID" \
+            --project-tags="SDLC=$SNYK_SDLC" \
+            --target-reference="$SNYK_TARGET_REF" \
+            --remote-repo-url="$SNYK_REMOTE_REPO_URL" \
+            --sarif-file-output=snyk-code.sarif
 
-      - name: Snyk test all supported app projects (eval mode)
-        if: steps.detect_manifests.outputs.has_manifests == 'true'
+      - name: Upload SARIF to GitHub
+        if: github.event_name == 'pull_request'
         continue-on-error: true
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-          SNYK_ORG_ID: ${{ secrets.SNYK_ORG_ID }}
-        run: |
-          # SCA (OPEN‑SOURCE DEPENDENCIES)
-          # Only run if we detected at least one supported manifest above.
-          # --all-projects: recursively discover all manifests (npm, Maven, etc.).
-          # --detection-depth: how deep in the tree to search.
-          # --severity-threshold=low: show everything (low and above) during eval.
-          # Eval mode: vulnerabilities will NOT fail the workflow.
-          snyk test --all-projects --detection-depth=6 --org="$SNYK_ORG_ID" --severity-threshold=low
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: target-repo/snyk-code.sarif
 
-      - name: Snyk monitor all supported app projects (eval mode)
-        if: steps.detect_manifests.outputs.has_manifests == 'true'
+      # =========================================================
+      # 🟢 RELEASE / MANUAL FLOW → FULL SCAN
+      # =========================================================
+
+      # IaC
+      - name: Snyk IaC test
+        if: github.event_name != 'pull_request'
+        working-directory: target-repo
         continue-on-error: true
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-          SNYK_ORG_ID: ${{ secrets.SNYK_ORG_ID }}
         run: |
-          # SCA MONITORING SNAPSHOT
-          # Sends all discovered app projects to Snyk so they appear in the Snyk UI,
-          # and can be tracked over time for new vulnerabilities (release-style view).
-          # Only runs when manifests exist; non‑blocking in eval mode.
-          snyk monitor --all-projects --org="$SNYK_ORG_ID"
+          snyk iac test . \
+            --org="$SNYK_ORG_ID" \
+            --severity-threshold=low \
+            --project-tags="SDLC=$SNYK_SDLC" \
+            --target-reference="$SNYK_TARGET_REF" \
+            --remote-repo-url="$SNYK_REMOTE_REPO_URL"
 
-      - name: Skip app SCA because no supported manifests were found
-        if: steps.detect_manifests.outputs.has_manifests != 'true'
-        run: |
-          # Documentation-only step:
-          # Makes it obvious in logs when this is an infra‑only repo
-          # and SCA/monitor steps were intentionally skipped.
-          echo "No supported app manifests found in this repo; skipping SCA and monitor steps."
-
-      - name: Snyk SAST (code) test (eval mode)
+      # SCA
+      - name: Snyk test (SCA)
+        if: github.event_name != 'pull_request' && steps.detect_manifests.outputs.has_manifests == 'true'
+        working-directory: target-repo
         continue-on-error: true
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-          SNYK_ORG_ID: ${{ secrets.SNYK_ORG_ID }}
         run: |
-          # SAST / SNYK CODE
-          # Run static application security testing against the source code in
-          # this repository (detects insecure coding patterns, logic issues, etc.).
-          # This mirrors the 'snyk code test' usage shown in your SAST docs.
-          # Eval mode: findings are reported but do NOT fail the workflow.
-          snyk code test --org="$SNYK_ORG_ID"
+          snyk test --all-projects \
+            --detection-depth=6 \
+            --org="$SNYK_ORG_ID" \
+            --severity-threshold=low \
+            --project-tags="SDLC=$SNYK_SDLC" \
+            --target-reference="$SNYK_TARGET_REF" \
+            --remote-repo-url="$SNYK_REMOTE_REPO_URL"
 
-      - name: Mark job as succeeded (eval mode)
-        if: always()
+      - name: Snyk monitor (SCA)
+        if: github.event_name != 'pull_request' && steps.detect_manifests.outputs.has_manifests == 'true'
+        working-directory: target-repo
+        continue-on-error: true
         run: |
-          # Final guard step:
-          # Ensures that even if Snyk commands returned non-zero exit codes,
-          # the overall job is marked successful. This keeps the entire workflow
-          # strictly informational / evaluation‑only.
-          echo "Snyk combined SCA + SAST + IaC scan ran in eval mode on GitHub-hosted runner; findings will not block."
+          snyk monitor --all-projects \
+            --org="$SNYK_ORG_ID" \
+            --project-tags="SDLC=$SNYK_SDLC" \
+            --target-reference="$SNYK_TARGET_REF" \
+            --remote-repo-url="$SNYK_REMOTE_REPO_URL"
+
+      # Container
+      - name: Detect Dockerfile
+        if: github.event_name != 'pull_request'
+        id: detect_docker
+        working-directory: target-repo
+        run: |
+          if [ -f Dockerfile ]; then
+            echo "has_docker=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_docker=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build Docker image
+        if: github.event_name != 'pull_request' && steps.detect_docker.outputs.has_docker == 'true'
+        working-directory: target-repo
+        run: |
+          docker build -t local-image:${{ github.sha }} .
+
+      - name: Snyk Container test
+        if: github.event_name != 'pull_request' && steps.detect_docker.outputs.has_docker == 'true'
+        working-directory: target-repo
+        continue-on-error: true
+        run: |
+          snyk container test local-image:${{ github.sha }} \
+            --org="$SNYK_ORG_ID" \
+            --severity-threshold=low \
+            --project-tags="SDLC=$SNYK_SDLC" \
+            --target-reference="$SNYK_TARGET_REF" \
+            --remote-repo-url="$SNYK_REMOTE_REPO_URL"
+
+      - name: Snyk Container monitor
+        if: github.event_name != 'pull_request' && steps.detect_docker.outputs.has_docker == 'true'
+        working-directory: target-repo
+        continue-on-error: true
+        run: |
+          snyk container monitor local-image:${{ github.sha }} \
+            --org="$SNYK_ORG_ID" \
+            --project-tags="SDLC=$SNYK_SDLC" \
+            --target-reference="$SNYK_TARGET_REF" \
+            --remote-repo-url="$SNYK_REMOTE_REPO_URL"
+
+      # =========================
+      # Final
+      # =========================
+      - name: Completed
+        run: echo "Snyk scan completed successfully"
