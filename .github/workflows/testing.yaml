@@ -13,7 +13,8 @@ on:
 
 jobs:
   security:
-    runs-on: ubuntu-latest          # Use GitHub-hosted runner
+    environment: test
+    runs-on: ubuntu-latest          
 
     steps:
       - name: Resolve repository from input
